@@ -14,5 +14,5 @@ Searches for quality upgrades in Radarr and Sonarr using a tag-based cycle syste
 - Config: `upgradinatorr.yml`
 
 - ## Credits
-Taken from BZ00001's [scripts](https://github.com/BZ00001/scripts).
-Based on original modules by [Drazzilb08](https://github.com/Drazzilb08/daps). Rewritten as standalone scripts with no framework dependency.
+- Taken from BZ00001's [scripts](https://github.com/BZ00001/scripts).
+- Based on original modules by [Drazzilb08](https://github.com/Drazzilb08/daps). Rewritten as standalone scripts with no framework dependency.
