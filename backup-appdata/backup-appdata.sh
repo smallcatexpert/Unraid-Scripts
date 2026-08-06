@@ -190,29 +190,63 @@ create_backup() {
     # Get the name of the source directory
     source_dir=$(basename "$source_dir")
 
-    if [ "$compress" == "true" ]; then
-        # If compress option is set to true
-        verbose_output "Backing up and compressing $container_name..."
-        # check if dry_run is set to true
-        if [ "$dry_run" == "true" ]; then
-            # if yes set extension to tar.7z.dry_run
-            extension="tar.7z.dry_run"
-            dry_run 
-        else
-            # if dry_run is set to false
-            extension="tar.7z"
-            # check if exclude_file is set and exists
-            if [ -n "$exclude_file" ] && [ -f "$exclude_file" ]; then
-                # if yes use it to exclude files from backup
-                tar --ignore-failed-read -cf - --exclude-from="$exclude_file" "$source_dir" | 7z a -si -t7z -m0=lzma2 -mx=1 -md=32m -mfb=64 -mmt=on -ms=off "$backup_file.$extension"
-            else
-                # if not just backup the source_dir
-                tar --ignore-failed-read -cf - "$source_dir" | 7z a -si -t7z -m0=lzma2 -mx=1 -md=32m -mfb=64 -mmt=on -ms=off "$backup_file.$extension"
-            fi
-        fi
-        # print message that compression is complete
-        verbose_output "Compression of $container_name complete"
+if [ "$compress" == "true" ]; then
+    verbose_output "Backing up and compressing $container_name..."
+
+    if [ "$dry_run" == "true" ]; then
+        extension="tar.zst.dry_run"
+        dry_run
     else
+        extension="tar.zst"
+
+        output_file="$backup_file.$extension"
+        partial_file="$output_file.partial"
+
+        # Remove leftovers from a previous failed attempt.
+        rm -f "$partial_file"
+
+        verbose_output "Creating Zstandard archive for $container_name..."
+
+        if [ -n "$exclude_file" ] && [ -f "$exclude_file" ]; then
+            tar --ignore-failed-read \
+                --exclude-from="$exclude_file" \
+                -cf - "$source_dir" |
+                zstd --threads=0 -3 -f -o "$partial_file"
+        else
+            tar --ignore-failed-read \
+                -cf - "$source_dir" |
+                zstd --threads=0 -3 -f -o "$partial_file"
+        fi
+
+        pipeline_status=("${PIPESTATUS[@]}")
+        tar_status="${pipeline_status[0]}"
+        zstd_status="${pipeline_status[1]}"
+
+        if [ "$tar_status" -ne 0 ] || [ "$zstd_status" -ne 0 ]; then
+            echo "ERROR: Backup failed for $container_name" >&2
+            echo "tar exit code: $tar_status" >&2
+            echo "zstd exit code: $zstd_status" >&2
+            rm -f "$partial_file"
+            return 1
+        fi
+
+        if [ ! -s "$partial_file" ]; then
+            echo "ERROR: Archive is empty for $container_name" >&2
+            rm -f "$partial_file"
+            return 1
+        fi
+
+        if ! zstd -t "$partial_file"; then
+            echo "ERROR: Zstandard verification failed for $container_name" >&2
+            rm -f "$partial_file"
+            return 1
+        fi
+
+        mv -f "$partial_file" "$output_file"
+
+        verbose_output "Compression of $container_name complete"
+    fi
+else
         # if compress option is set to false
         verbose_output "Backing up $container_name"
         # check if dry_run is set to true
@@ -893,10 +927,10 @@ check_config() {
         echo "ERROR: Your source directory ($destination_dir) is not set please check your configuration"
         exit 0
     fi
-    # Check if 7zip command is available if compress is set to true
+    # Check if Zstandard is available if compress is set to true
     if [ "$compress" == "true" ]; then
-        command -v 7z >/dev/null 2>&1 || {
-            echo -e "7Zip is not installed.\nPlease install 7Zip and rerun.\nIf on unRaid 7Zip can be found through NerdPack/NerdTools in the UnRaid appstore" >&2
+        command -v zstd >/dev/null 2>&1 || {
+            echo -e "Zstandard is not installed. Please install zstd and rerun." >&2
             exit 0
         }
     fi
@@ -984,384 +1018,4 @@ main() {
     fi
 }
 
-main #!/bin/bash
-#                            _       _          ____             _                   _____           _       _
-#      /\                   | |     | |        |  _ \           | |                 / ____|         (_)     | |
-#     /  \   _ __  _ __   __| | __ _| |_ __ _  | |_) | __ _  ___| | ___   _ _ __   | (___   ___ _ __ _ _ __ | |_
-#    / /\ \ | '_ \| '_ \ / _` |/ _` | __/ _` | |  _ < / _` |/ __| |/ / | | | '_ \   \___ \ / __| '__| | '_ \| __|
-#   / ____ \| |_) | |_) | (_| | (_| | || (_| | | |_) | (_| | (__|   <| |_| | |_) |  ____) | (__| |  | | |_) | |_
-#  /_/    \_\ .__/| .__/ \__,_|\__,_|\__\__,_| |____/ \__,_|\___|_|\_\\__,_| .__/  |_____/ \___|_|  |_| .__/ \__|
-#           | |   | |                                                      | |                        | |
-#           |_|   |_|                                                      |_|                        |_|
-#
-# v3.5.16
-
-# Define where your config file is located
-config_file=''
-
-#------------- DO NOT MODIFY BELOW THIS LINE -------------#
-debug=no # Testing Only
-# shellcheck source=backup-appdata.conf
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-error_handling_function() {
-    if [ -z "$config_file" ]; then
-        echo -e "Config file location not defined... Looking in root directory..."
-        source "$script_dir/backup-appdata.conf"
-    else
-        # shellcheck source=/dev/null
-        source "$config_file"
-    fi
-
-    if [ "$use_discord" == "yes" ] && [ -z "$webhook" ]; then
-        echo "ERROR: You're attempting to use the Discord integration but did not enter the webhook url."
-        exit 1
-    fi
-
-    if [ "$compress" == "yes" ]; then
-        command -v 7z >/dev/null 2>&1 || {
-            echo -e "7Zip is not installed.\nPlease install 7Zip and rerun.\nIf on unRaid, 7Zip can be found through the NerdTools which is found in the appstore" >&2
-            exit 1
-        }
-    fi
-
-    if ! [ -f "$exclude_file" ] && [ -n "$exclude_file" ]; then
-        echo "You have set the exclude file but it does not exist."
-        exit 1
-    fi
-
-    if [ -e "/tmp/i.am.running.appdata.tmp" ]; then
-        echo "Another instance of the script is running. Aborting."
-        echo "Please use rm /tmp/i.am.running.appdata.tmp in your terminal to remove the locking file"
-        exit 1
-    else
-        touch "/tmp/i.am.running.appdata.tmp"
-    fi
-}
-backup_function() {
-    if [ "$compress" == "yes" ]; then
-        echo -e "Compressing $name..."
-        if [ "$debug" == "yes" ]; then
-            if [ "$alternate_format" != "yes" ]; then
-                tar cf - "$path" -T /dev/null | 7z a -si -t7z -m0=lzma -mx=9 -mfb=64 -md=32m -ms=on "$dest/$dt/$name-$now.tar.7z"
-            else
-                tar cf - "$path" -T /dev/null | 7z a -si -t7z -m0=lzma -mx=9 -mfb=64 -md=32m -ms=on "$dest/$dt/$name.tar.7z"
-            fi
-        else
-            if [ "$alternate_format" != "yes" ]; then
-                if [ -n "$exclude_file" ]; then
-                    tar cf - --exclude-from="$exclude_file" "$path" | 7z a -si -t7z -m0=lzma -mx=9 -mfb=64 -md=32m -ms=on "$dest/$dt/$name-$now.tar.7z"
-                else
-                    tar cf - "$path" | 7z a -si -t7z -m0=lzma -mx=9 -mfb=64 -md=32m -ms=on "$dest/$dt/$name-$now.tar.7z"
-                fi
-            else
-                if [ -n "$exclude_file" ]; then
-                    tar cf - --exclude-from="$exclude_file" "$path" | 7z a -si -t7z -m0=lzma -mx=9 -mfb=64 -md=32m -ms=on "$dest/$dt/$name.tar.7z"
-
-                else
-                    tar cf - "$path" | 7z a -si -t7z -m0=lzma -mx=9 -mfb=64 -md=32m -ms=on "$dest/$dt/$name.tar.7z"
-
-                fi
-            fi
-        fi
-        echo -e "Compression of $name complete"
-    else
-        echo -e "Archiving $name"
-        if [ "$debug" == "yes" ]; then
-            if [ "$alternate_format" != "yes" ]; then
-                tar -cf "$dest/$dt/$name-$now-debug.tar" -T /dev/null
-            else
-                tar -cf "$dest/$dt/$name-debug.tar" -T /dev/null
-            fi
-        else
-            if [ "$alternate_format" != "yes" ]; then
-                if [ -n "$exclude_file" ]; then
-                    tar cWfC "$dest/$dt/$name-$now.tar" "$(dirname "$path")" -X "$exclude_file" "$(basename "$path")"
-                else
-                    tar cWfC "$dest/$dt/$name-$now.tar" "$(dirname "$path")" "$(basename "$path")"
-                fi
-            else
-                if [ -n "$exclude_file" ]; then
-                    tar cWfC "$dest/$dt/$name.tar" "$(dirname "$path")" -X "$exclude_file" "$(basename "$path")"
-                else
-                    tar cWfC "$dest/$dt/$name.tar" "$(dirname "$path")" "$(basename "$path")"
-                fi
-            fi
-        fi
-        echo -e "Archiving $name complete"
-    fi
-}
-
-info_function() {
-    if [ "$compress" == yes ]; then
-        if [ "$debug" == "yes" ]; then
-            if [ "$alternate_format" != "yes" ]; then
-                container_size=$(du -sh "$dest/$dt/$name-$now-debug.tar.7z" | awk '{print $1}')
-            else
-                container_size=$(du -sh "$dest/$dt/$name-debug.tar.7z" | awk '{print $1}')
-            fi
-        else
-            if [ "$alternate_format" != "yes" ]; then
-                container_size=$(du -sh "$dest/$dt/$name-$now.tar.7z" | awk '{print $1}')
-            else
-                container_size=$(du -sh "$dest/$dt/$name.tar.7z" | awk '{print $1}')
-            fi
-        fi
-        echo "Container: $name Size: $container_size" | tee -a "$1"
-    else
-        if [ "$debug" == "yes" ]; then
-            if [ "$alternate_format" != "yes" ]; then
-                container_size=$(du -sh "$dest/$dt/$name-$now-debug.tar" | awk '{print $1}')
-            else
-                container_size=$(du -sh "$dest/$dt/$name-debug.tar" | awk '{print $1}')
-            fi
-        else
-            if [ "$alternate_format" != "yes" ]; then
-                container_size=$(du -sh "$dest/$dt/$name-$now.tar" | awk '{print $1}')
-            else
-                container_size=$(du -sh "$dest/$dt/$name.tar" | awk '{print $1}')
-            fi
-        fi
-        echo "Container: $name Size: $container_size" | tee -a "$1"
-    fi
-}
-
-discord_function() {
-    get_ts=$(date -u -Iseconds)
-    if [ "$(wc <"$appdata_error" -l)" -ge 1 ]; then
-        curl -s -H "Content-Type: application/json" -X POST -d '{"username": "'"${bot_name}"'","avatar_url": "https://cdn0.iconfinder.com/data/icons/shift-free/32/Error-128.png", "embeds": [{"thumbnail": {"url": "https://cdn0.iconfinder.com/data/icons/shift-free/32/Error-1024.png"}, "title": "Error notificaitons", "fields": [{"name": "Errors:","value": "'"$(jq -Rs '.' "${appdata_error}" | sed -e 's/^"//' -e 's/"$//')"'"}],"footer": {"text": "Powered by: Drazzilb | Adam & Eve were the first ones to ignore the Apple terms and conditions.","icon_url": "https://i.imgur.com/r69iYhr.png"},"color": "16711680","timestamp": "'"${get_ts}"'"}]}' "$webhook"
-        echo -e "\nDiscord error notification sent."
-    fi
-    if [ "$use_summary" == "yes" ]; then
-        curl -s -H "Content-Type: application/json" -X POST -d '{"username": "'"${bot_name}"'","embeds": [{"title": "Appdata Backup Complete", "fields": [{"name": "Runtime:","value": "'"${run_output}"'"},{"name": "'"This Backup's size:"'","value": "'"${run_size}"'"},{"name": "Total size of all backups:","value": "'"${total_size}"'"}],"footer": {"text": "Powered by: Drazzilb | Could he be more heartless?","icon_url": "https://i.imgur.com/r69iYhr.png"},"color": "'"${bar_color}"'","timestamp": "'"${get_ts}"'"}]}' "$webhook"
-    else
-        if [ "$(wc <"$appdata_no_container" -l)" -ge 1 ]; then
-            if [ "$(wc <"$appdata_stop" -l)" -ge 1 ] && [ "$(wc <"$appdata_nostop" -l)" -eq 0 ]; then
-                curl -s -H "Content-Type: application/json" -X POST -d '{"username": "'"${bot_name}"'","embeds": [{"title": "Appdata Backup Complete", "fields": [{"name": "Runtime:","value": "'"${run_output}"'"},{"name": "'"This Backup's size:"'","value": "'"${run_size}"'"},{"name": "Total size of all backups:","value": "'"${total_size}"'"},{"name": "'"Containers stopped & backed up: ${stop_counter}"'","value": "'"$(jq -Rs '.' "${appdata_stop}" | sed -e 's/^"//' -e 's/"$//')"'"},{"name": "'"Folders without containers backed up: ${no_container_counter}"'","value": "'"$(jq -Rs '.' "${appdata_no_container}" | sed -e 's/^"//' -e 's/"$//')"'"}],"footer": {"text": "Powered by: Drazzilb | Could he be more heartless?","icon_url": "https://i.imgur.com/r69iYhr.png"},"color": "'"${bar_color}"'","timestamp": "'"${get_ts}"'"}]}' "$webhook"
-            fi
-            if [ "$(wc <"$appdata_stop" -l)" -eq 0 ] && [ "$(wc <"$appdata_nostop" -l)" -ge 1 ]; then
-                curl -s -H "Content-Type: application/json" -X POST -d '{"username": "'"${bot_name}"'","embeds": [{"title": "Appdata Backup Complete", "fields": [{"name": "Runtime:","value": "'"${run_output}"'"},{"name": "'"This Backup's size:"'","value": "'"${run_size}"'"},{"name": "Total size of all backups:","value": "'"${total_size}"'"},{"name": "'"Containers not stopped but backed up: ${nostop_counter}"'","value": "'"$(jq -Rs '.' "${appdata_nostop}" | sed -e 's/^"//' -e 's/"$//')"'"},{"name": "'"Folders without containers backed up: ${no_container_counter}"'","value": "'"$(jq -Rs '.' "${appdata_no_container}" | sed -e 's/^"//' -e 's/"$//')"'"}],"footer": {"text": "Powered by: Drazzilb | I threw a boomerang a couple years ago; I know live in constant fear.","icon_url": "https://i.imgur.com/r69iYhr.png"},"color": "'"${bar_color}"'","timestamp": "'"${get_ts}"'"}]}' "$webhook"
-            fi
-            if [ "$(wc <"$appdata_stop" -l)" -ge 1 ] && [ "$(wc <"$appdata_nostop" -l)" -ge 1 ]; then
-                curl -s -H "Content-Type: application/json" -X POST -d '{"username": "'"${bot_name}"'","embeds": [{"title": "Appdata Backup Complete", "fields": [{"name": "Runtime:","value": "'"${run_output}"'"},{"name": "'"This Backup's size:"'","value": "'"${run_size}"'"},{"name": "Total size of all backups:","value": "'"${total_size}"'"},{"name": "'"Containers stopped & backed up: ${stop_counter}"'","value": "'"$(jq -Rs '.' "${appdata_stop}" | sed -e 's/^"//' -e 's/"$//')"'"},{"name": "'"Containers not stopped but backed up: ${nostop_counter}"'","value": "'"$(jq -Rs '.' "${appdata_nostop}" | sed -e 's/^"//' -e 's/"$//')"'"},{"name": "'"Folders without containers backed up: ${no_container_counter}"'","value": "'"$(jq -Rs '.' "${appdata_no_container}" | sed -e 's/^"//' -e 's/"$//')"'"}],"footer": {"text": "Powered by: Drazzilb | The man who invented knock-knock jokes should get a no bell prize.","icon_url": "https://i.imgur.com/r69iYhr.png"},"color": "'"${bar_color}"'","timestamp": "'"${get_ts}"'"}]}' "$webhook"
-            fi
-        else
-            if [ "$(wc <"$appdata_stop" -l)" -ge 1 ] && [ "$(wc <"$appdata_nostop" -l)" -eq 0 ]; then
-                curl -s -H "Content-Type: application/json" -X POST -d '{"username": "'"${bot_name}"'","embeds": [{"title": "Appdata Backup Complete", "fields": [{"name": "Runtime:","value": "'"${run_output}"'"},{"name": "'"This Backup's size:"'","value": "'"${run_size}"'"},{"name": "Total size of all backups:","value": "'"${total_size}"'"},{"name": "'"Containers stopped & backed up: ${stop_counter}"'","value": "'"$(jq -Rs '.' "${appdata_stop}" | sed -e 's/^"//' -e 's/"$//')"'"}],"footer": {"text": "Powered by: Drazzilb | Could he be more heartless?","icon_url": "https://i.imgur.com/r69iYhr.png"},"color": "'"${bar_color}"'","timestamp": "'"${get_ts}"'"}]}' "$webhook"
-            fi
-            if [ "$(wc <"$appdata_stop" -l)" -eq 0 ] && [ "$(wc <"$appdata_nostop" -l)" -ge 1 ]; then
-                curl -s -H "Content-Type: application/json" -X POST -d '{"username": "'"${bot_name}"'","embeds": [{"title": "Appdata Backup Complete", "fields": [{"name": "Runtime:","value": "'"${run_output}"'"},{"name": "'"This Backup's size:"'","value": "'"${run_size}"'"},{"name": "Total size of all backups:","value": "'"${total_size}"'"},{"name": "'"Containers not stopped but backed up: ${nostop_counter}"'","value": "'"$(jq -Rs '.' "${appdata_nostop}" | sed -e 's/^"//' -e 's/"$//')"'"}],"footer": {"text": "Powered by: Drazzilb | I threw a boomerang a couple years ago; I know live in constant fear.","icon_url": "https://i.imgur.com/r69iYhr.png"},"color": "'"${bar_color}"'","timestamp": "'"${get_ts}"'"}]}' "$webhook"
-            fi
-            if [ "$(wc <"$appdata_stop" -l)" -ge 1 ] && [ "$(wc <"$appdata_nostop" -l)" -ge 1 ]; then
-                curl -s -H "Content-Type: application/json" -X POST -d '{"username": "'"${bot_name}"'","embeds": [{"title": "Appdata Backup Complete", "fields": [{"name": "Runtime:","value": "'"${run_output}"'"},{"name": "'"This Backup's size:"'","value": "'"${run_size}"'"},{"name": "Total size of all backups:","value": "'"${total_size}"'"},{"name": "'"Containers stopped & backed up: ${stop_counter}"'","value": "'"$(jq -Rs '.' "${appdata_stop}" | sed -e 's/^"//' -e 's/"$//')"'"},{"name": "'"Containers not stopped but backed up: ${nostop_counter}"'","value": "'"$(jq -Rs '.' "${appdata_nostop}" | sed -e 's/^"//' -e 's/"$//')"'"}],"footer": {"text": "Powered by: Drazzilb | The man who invented knock-knock jokes should get a no bell prize.","icon_url": "https://i.imgur.com/r69iYhr.png"},"color": "'"${bar_color}"'","timestamp": "'"${get_ts}"'"}]}' "$webhook"
-            fi
-        fi
-    fi
-    # fi
-    echo -e "\nDiscord notification sent."
-}
-
-container_error_function() {
-    if [ "$(docker ps -a -f name="$name" | wc -l)" -ge 2 ]; then
-        if [ ! -d "$path" ]; then
-            echo -e "Container $name exists but the directory $path does not exist... Skipping" | tee -a "${appdata_error}"
-            return 1
-        fi
-    else
-        if [ ! -d "$path" ]; then
-            echo -e "Container $name does not exist and $path does not exist... Skipping" | tee -a "${appdata_error}"
-            return 1
-        else
-            echo -e "Container $name does not exist but the directory $path exists... Skipping" | tee -a "${appdata_error}"
-            return 1
-        fi
-    fi
-}
-
-backup_stop_function() {
-    echo -e "Stopping and backing up containers..."
-    echo -e "----------------------------------------------"
-    for ((i = 0; i < ${#list[@]}; i += 2)); do
-        name=${list[i]} path=${list[i + 1]}
-        container_error_function
-        if [ $? == 1 ]; then
-            echo -e "----------------------------------------------"
-            continue
-        fi
-        cRunning="$(docker ps -a --format '{{.Names}}' -f status=running)"
-        if echo "$cRunning" | grep -iqF "$name"; then
-            echo -e "Stopping $name"
-            if [ "$debug" != "yes" ]; then
-                docker stop -t 60 "$name" >/dev/null 2>&1
-            fi
-            backup_function
-            echo -e "Starting $name"
-            docker start "$name" >/dev/null 2>&1
-        else
-            echo -e "$name is already stopped"
-            backup_function
-            echo -e "$name was stopped before backup, ignoring startup"
-        fi
-        info_function "$appdata_stop"
-        stop_counter=$((stop_counter + 1))
-        if [ "$debug" == "yes" ]; then
-            echo "Backup stop_counter: $stop_counter"
-        fi
-        echo -e "----------------------------------------------"
-    done
-}
-
-backup_nostop_function() {
-    echo -e "Backing up containers without stopping them..."
-    echo -e "----------------------------------------------"
-    for ((i = 0; i < ${#list_no_stop[@]}; i += 2)); do
-        name=${list_no_stop[i]} path=${list_no_stop[i + 1]}
-        container_error_function
-        if [ $? == 1 ]; then
-            echo -e "----------------------------------------------"
-            continue
-        fi
-        backup_function
-        echo "Finished backup for $name"
-        info_function "$appdata_nostop"
-        nostop_counter=$((nostop_counter + 1))
-        if [ "$debug" == "yes" ]; then
-            echo "Backup stop_counter: $nostop_counter"
-        fi
-        echo -e "----------------------------------------------"
-    done
-}
-
-backup_no_container_function() {
-    echo -e "Backing up directories without containers"
-    echo -e "----------------------------------------------"
-    for i in "${list_no_container[@]}"; do
-        path=$i
-        name=$(basename "${i}")
-        if [ ! -d "$path" ]; then
-            echo -e "Path name $path does not exist... Skipping" | tee -a "$appdata_error"
-            continue
-        fi
-        backup_function
-        no_container_counter=$((no_container_counter + 1))
-        echo "Finished backup for $name"
-        # Information Gathering
-        info_function "$appdata_no_container"
-        echo -e "----------------------------------------------"
-    done
-}
-
-cleanup_function() {
-    cd "$destination" || exit
-    echo -e "Removing all but the last " $keep_backup "backups... please wait"
-    ls -1tr | head -n -$keep_backup | xargs -d '\n' rm -rfd --
-
-    echo "Done"
-}
-
-runtime_function() {
-    end=$(date +%s)
-    run_size=$(du -sh "$dest/$dt/" | awk '{print $1}')
-    total_time=$((end - start))
-    seconds=$((total_time % 60))
-    minutes=$((total_time % 3600 / 60))
-    hours=$((total_time / 3600))
-
-    if ((minutes == 0 && hours == 0)); then
-        run_output="Appdata completed in $seconds seconds"
-    elif ((hours == 0)); then
-        run_output="Appdata completed in $minutes minutes and $seconds seconds"
-    else
-        run_output="Appdata completed in $hours hours $minutes minutes and $seconds seconds"
-    fi
-    echo "$run_output"
-    echo -e "\nThis backup's size: $run_size"
-    if [ -d "$dest"/ ]; then
-        total_size=$(du -sh "$dest" | awk '{print $1}')
-        echo -e "Total size of all backups: $total_size"
-    fi
-}
-debug_output_function() {
-    echo -e "Script has ended with debug set to ${debug}"
-    echo -e "Bot name $bot_name"
-    echo -e "Runetime: $run_output"
-    echo -e "Runsize: $run_size"
-    echo -e "Total Size: $total_size"
-    echo -e "Barcolor: $bar_color"
-    echo -e "get_ts: $get_ts"
-    echo -e "Webhook: $webhook"
-    echo -e "line count for appdata_error.tmp  = $(wc -l <"$appdata_error")"
-    echo -e "stop_counter = $(wc -l <"$appdata_stop")"
-    echo -e "nostop_counter = $(wc -l <"$appdata_nostop")"
-    echo -e "no_container_counter" = "$(wc -l <"$appdata_no_container")"
-    echo -e "Source = $appdata"
-    echo -e "Destination = $destination"
-}
-
-clean_files_function() {
-    rm '/tmp/i.am.running.appdata.tmp'
-    rm "$appdata_stop"
-    rm "$appdata_nostop"
-    rm "$appdata_error"
-    rm "$appdata_no_container"
-}
-
-global_variables_function() {
-    start=$(date +%s) #Sets start time for runtime information
-    cd "$(realpath -s "$appdata")" || exit
-    if [ "$alternate_format" == "yes" ]; then
-        dt=$(date +"%Y-%m-%d"@%H.%M)
-        now=""
-    else
-        dt=$(date +"%Y-%m-%d")
-        now=$(date +"%H.%M")
-    fi
-    dest=$(realpath -s "$destination")
-    appdata_error=$(mktemp)
-    appdata_stop=$(mktemp)
-    appdata_nostop=$(mktemp)
-    appdata_no_container=$(mktemp)
-    stop_counter=0
-    nostop_counter=0
-    no_container_counter=0
-}
-
-main() {
-    error_handling_function
-    global_variables_function
-    if [ ! -d "$dest" ]; then
-        echo "Making directory at ${dest}"
-        mkdir -p "$dest"
-    fi
-    mkdir -p "$dest/$dt"
-    if [ ${#list[@]} -ge 1 ]; then
-        backup_stop_function
-    else
-        echo -e "No containers were stopped and backed up due to list being empty\n"
-    fi
-    if [ ${#list_no_stop[@]} -ge 1 ]; then
-        backup_nostop_function
-    else
-        echo -e "No containers were backed without stopping up due to list_no_stop being empty\n"
-    fi
-    if [ ${#list_no_container[@]} -ge 1 ]; then
-        backup_no_container_function
-    else
-        echo -e "No directories without containers were backed up due to list_no_container being empty\n"
-    fi
-    sleep 2
-    chmod -R 777 "$dest"
-    cleanup_function
-    runtime_function
-    if [ "$unraid_notify" == "yes" ]; then
-        /usr/local/emhttp/plugins/dynamix/scripts/notify -s "AppData Backup" -d "Backup of ALL Appdata complete."
-    fi
-    if [ "$use_discord" == "yes" ]; then
-        discord_function
-    fi
-    if [ "$debug" == "yes" ]; then
-        debug_output_function
-    fi
-    clean_files_function
-    echo -e '\nAll Done!\n'
-}
-main
+main 
